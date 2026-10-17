@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.bak
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Secret and configuration files
+.env
+*.env
+!*.env.example
+
+# Runtime and data directories
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+logs/
+*.log
+
+# Workspace / Testing artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local data dumps from standalone runs
+input.txt
+output.txt
+checked.txt
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini

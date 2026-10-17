@@ -1,0 +1,383 @@
+import asyncio
+import aiohttp
+import os
+import sys
+import time
+import logging
+from typing import List, Dict, Optional
+import platform
+import unicodedata
+
+
+if sys.platform == "win32":
+    import os
+    os.system("chcp 65001 > nul")
+    
+if sys.stdout.encoding != 'utf-8':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+# -------------------------
+# ⚙️ All Configuration Variables in One Place
+# -------------------------
+
+# Facebook Settings
+API_VERSION = "v17.0"
+FB_GRAPH = f"https://graph.facebook.com/{API_VERSION}"
+
+
+# FB_USER_ACCESS_TOKEN = input('ENTER_UR_ACC_ACCESS_TOKEN\t:\t')
+
+FB_USER_ACCESS_TOKEN = 'EAAD6V7os0gcBQo8HqTV6RZBJL9r3jMZCCw7xt5fJrpuTkZBZBx2Fvl5hbNGiK1ES6Tdd5meZCZBuD8fZB6EEET5FIZCRZAL7mWb8GTKuoiwsNXhXOyjkm5zPvu3tU1B1GT3GZCsPZBSZCC1z46NFplsoRkdEKr4Al2DtF4fq0pCScypdvHaPhHlENqlWG1MAVa4lAs2Y31kTuVKZBwwZDZD'
+
+
+# Telegram Settings
+TELEGRAM_BOT_TOKEN = "7127482770:AAHd6F4eNAmaYVoEAMWFTKTx2eJvPvCCaDw"
+TELEGRAM_CHAT_ID = "1167798421"
+
+# Batch Settings
+BATCH_SIZE = 9                          # Number of pages per batch
+CONCURRENCY_PAGES = 9                   # Number of concurrent pages within batch
+PAGE_CONV_LIMIT = 499                   # Number of conversations per request
+HTTP_TIMEOUT = 120                      # HTTP timeout in seconds
+RETRY_ATTEMPTS = 4                      # Number of retry attempts
+MAX_BACKOFF_SECONDS = 30                # Maximum wait time between attempts
+
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+
+logger = logging.getLogger("fb-open-convs")
+
+def now_ts():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+# Helper function to fix Arabic text display
+def fix_arabic_display(text):
+    """Fix Arabic text display in Windows console"""
+    if not text:
+        return text
+    try:
+        # Normalize the text
+        text = unicodedata.normalize('NFKC', str(text))
+        return text
+    except Exception:
+        return text
+
+# ---------- fetch json with retries & exponential backoff ----------
+async def fetch_json(session: aiohttp.ClientSession, url: str, params: Optional[dict] = None, retry: int = RETRY_ATTEMPTS):
+    params = params or {}
+    attempt = 0
+    while attempt < retry:
+        attempt += 1
+        try:
+            async with session.get(url, params=params, timeout=30) as resp:
+                text = await resp.text()
+                status = resp.status
+                if 200 <= status < 300:
+                    return await resp.json()
+                else:
+                    try:
+                        j = await resp.json()
+                    except Exception:
+                        j = {"error": {"message": text, "code": status}}
+                    if status in (429, 500, 502, 503, 504) and attempt < retry:
+                        wait = min(MAX_BACKOFF_SECONDS, 0.5 * (2 ** (attempt - 1)))
+                        logger.warning("[%s] HTTP %s for %s (attempt %s) - sleeping %.1fs", now_ts(), status, url, attempt, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    return j
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if attempt >= retry:
+                logger.exception("[%s] Network error fetching %s: %s", now_ts(), url, e)
+                raise
+            wait = min(MAX_BACKOFF_SECONDS, 0.5 * (2 ** (attempt - 1)))
+            logger.warning("[%s] Network error on %s (attempt %s): %s - sleeping %.1fs", now_ts(), url, attempt, e, wait)
+            await asyncio.sleep(wait)
+    raise RuntimeError("fetch_json failed after retries")
+
+# ---------- get pages ----------
+async def get_pages(session: aiohttp.ClientSession, user_access_token: str) -> List[Dict]:
+    url = f"{FB_GRAPH}/me/accounts"
+    params = {"access_token": user_access_token, "fields": "id,name,access_token", "limit": 100}
+    data = await fetch_json(session, url, params=params)
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(f"FB error getting pages: {data.get('error')}")
+    pages = []
+    while True:
+        items = data.get("data", []) if isinstance(data, dict) else []
+        pages.extend(items)
+        paging = data.get("paging", {}) if isinstance(data, dict) else {}
+        next_url = paging.get("next")
+        if next_url:
+            data = await fetch_json(session, next_url, params={})
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(f"FB error paging pages: {data.get('error')}")
+            continue
+        break
+    return pages
+
+# ---------- iterate conversation batches ----------
+async def iterate_conversation_batches(session: aiohttp.ClientSession, page_id: str, page_token: str, limit: int = PAGE_CONV_LIMIT):
+    url = f"{FB_GRAPH}/{page_id}/conversations"
+    params = {"access_token": page_token, "fields": "id,unread_count,tags", "limit": limit}
+    data = await fetch_json(session, url, params=params)
+    if isinstance(data, dict) and data.get("error"):
+        logger.warning("[%s] Warning getting conversations for page %s: %s", now_ts(), page_id, data.get("error"))
+        return
+    while True:
+        items = data.get("data", []) if isinstance(data, dict) else []
+        yield items
+        paging = data.get("paging", {}) if isinstance(data, dict) else {}
+        next_url = paging.get("next")
+        if next_url:
+            data = await fetch_json(session, next_url, params={})
+            if isinstance(data, dict) and data.get("error"):
+                logger.warning("[%s] Warning paging conversations for page %s: %s", now_ts(), page_id, data.get("error"))
+                return
+            continue
+        break
+
+# ---------- heuristic: is conversation open? ----------
+def conv_is_open(conv: Dict) -> bool:
+    try:
+        if "unread_count" in conv and conv["unread_count"] is not None:
+            try:
+                if int(conv["unread_count"]) > 0:
+                    return True
+            except Exception:
+                pass
+        tags = conv.get("tags")
+        if tags and isinstance(tags, list) and len(tags) > 0:
+            tag_names = []
+            for t in tags:
+                if isinstance(t, dict):
+                    name = t.get("name") or t.get("tag") or ""
+                    if name:
+                        tag_names.append(str(name).lower())
+                elif isinstance(t, str):
+                    tag_names.append(t.lower())
+            for closed_kw in ("done", "closed", "archived", "resolved"):
+                if any(closed_kw in tn for tn in tag_names):
+                    return False
+            return True
+    except Exception:
+        logger.exception("conv_is_open error for conv: %s", conv.get("id"))
+    return False
+
+# ---------- process single page ----------
+async def process_page(session: aiohttp.ClientSession, page: Dict):
+    page_id = page.get("id")
+    page_name = fix_arabic_display(page.get("name", "<no-name>"))
+    page_token = page.get("access_token")
+    if not page_token:
+        logger.warning("[%s] page '%s' (%s) has no page access token. Skipping.", now_ts(), page_name, page_id)
+        return {"id": page_id, "name": page_name, "open_convs": 0, "total_scanned": 0, "note": "no_page_token"}
+
+    logger.info("[%s] Starting page '%s' (%s) ...", now_ts(), page_name, page_id)
+    total = 0
+    open_count = 0
+    try:
+        async for batch in iterate_conversation_batches(session, page_id, page_token, limit=PAGE_CONV_LIMIT):
+            if not batch:
+                continue
+            for conv in batch:
+                total += 1
+                try:
+                    if conv_is_open(conv):
+                        open_count += 1
+                except Exception:
+                    pass
+            logger.info("[%s] Page '%s' scanned batch: %s convs — total scanned so far: %s (open: %s)", now_ts(), page_name, len(batch), total, open_count)
+        logger.info("[%s] Finished page '%s' — total scanned: %s, open conversations: %s", now_ts(), page_name, total, open_count)
+        return {"id": page_id, "name": page_name, "open_convs": open_count, "total_scanned": total, "note": "ok"}
+    except Exception as e:
+        logger.exception("Error processing page '%s': %s", page_name, e)
+        return {"id": page_id, "name": page_name, "open_convs": open_count, "total_scanned": total, "note": f"error:{e}"}
+
+# ---------- Telegram helper ----------
+async def send_telegram_message(session: aiohttp.ClientSession, bot_token: str, chat_id: str, text: str):
+    if not bot_token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    async with session.post(url, data=payload) as resp:
+        text_resp = await resp.text()
+        if not (200 <= resp.status < 300):
+            raise RuntimeError(f"Telegram send failed {resp.status}: {text_resp}")
+        return await resp.json()
+
+# ---------- helper: chunk list ----------
+def chunked(iterable: List, n: int):
+    """Yield successive n-sized chunks from iterable."""
+    for i in range(0, len(iterable), n):
+        yield iterable[i:i + n]
+
+# ---------- Select pages from user ----------
+def select_pages_interactive(pages: List[Dict]) -> List[Dict]:
+    """Display pages and let user choose"""
+    if not pages:
+        print("❌ No pages available!")
+        return []
+    
+    print("\n" + "="*70)
+    print("📄 Available Pages:")
+    print("="*70)
+    
+    for idx, page in enumerate(pages, 1):
+        page_id = page.get("id")
+        page_name = fix_arabic_display(page.get("name", "<no-name>"))
+        print(f"{idx}. {page_name} (ID: {page_id})")
+    
+    print("="*70)
+    print("Options:")
+    print("  • Enter a single number: to select one page")
+    print("  • Enter multiple numbers separated by comma: 1,3,5")
+    print("  • Type 'all': to select all pages")
+    print("  • Type 'quit': to exit")
+    print("="*70 + "\n")
+    
+    while True:
+        user_input = input("🔍 Select pages: ").strip()
+
+        # user_input = 'all'
+        
+        if user_input.lower() == 'quit':
+            print("❌ Cancelled")
+            return []
+        
+        if user_input.lower() == 'all':
+            print(f"✅ Selected all pages ({len(pages)})")
+            return pages
+        
+        try:
+            indices = [int(x.strip()) - 1 for x in user_input.split(",")]
+            
+            # Validate numbers
+            if any(i < 0 or i >= len(pages) for i in indices):
+                print("❌ Invalid number! Try again")
+                continue
+            
+            selected = [pages[i] for i in indices]
+            print(f"\n✅ Selected {len(selected)} page(s):")
+            for page in selected:
+                page_name = fix_arabic_display(page.get('name', '<no-name>'))
+                print(f"   • {page_name} (ID: {page.get('id')})")
+            print()
+            return selected
+            
+        except ValueError:
+            print("❌ Invalid input! Use numbers separated by comma (example: 1,2,3)")
+            continue
+
+# ---------- main async function ----------
+async def main_async(fb_user_token: str, tg_bot_token: str, tg_chat_id: str):
+    connector = aiohttp.TCPConnector(limit_per_host=10)
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        # Fetch all pages
+        logger.info("[%s] Fetching pages for the account ...", now_ts())
+        all_pages = await get_pages(session, fb_user_token)
+        logger.info("[%s] Found %s pages.", now_ts(), len(all_pages))
+        
+        if not all_pages:
+            print("❌ No pages found!")
+            return []
+        
+        # Select pages
+        print("\n🌍 Successfully fetched pages!\n")
+        selected_pages = select_pages_interactive(all_pages)
+        
+        if not selected_pages:
+            print("❌ No pages selected.")
+            return []
+        
+        # Process pages
+        pages = selected_pages
+        results = []
+        batch_number = 0
+        
+        print(f"\n⏳ Processing {len(pages)} page(s)...\n")
+        
+        for batch in chunked(pages, BATCH_SIZE):
+            batch_number += 1
+            logger.info("[%s] Starting batch %s: %s pages (processing up to %s concurrently)...", now_ts(), batch_number, len(batch), CONCURRENCY_PAGES)
+            sem_pages = asyncio.Semaphore(CONCURRENCY_PAGES)
+            
+            async def worker(p):
+                async with sem_pages:
+                    return await process_page(session, p)
+            
+            tasks = [asyncio.create_task(worker(p)) for p in batch]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=False)
+            results.extend(batch_results)
+            logger.info("[%s] Finished batch %s.", now_ts(), batch_number)
+            await asyncio.sleep(0.5)
+
+        # Build report
+        lines = ["*FB Open Conversations Report:*"]
+        for r in results:
+            page_name = fix_arabic_display(r.get('name', '<no-name>'))
+            lines.append(f"\n*Page:* {page_name} \nScanned: {r.get('total_scanned')}\nOpen: {r.get('open_convs')}\n  Note: {r.get('note')}\n")
+        report = "\n".join(lines)
+
+        logger.info("[%s] All pages processed. Sending Telegram report...", now_ts())
+        try:
+            if tg_bot_token and tg_chat_id:
+                max_len = 3800
+                if len(report) <= max_len:
+                    await send_telegram_message(session, tg_bot_token, tg_chat_id, report)
+                else:
+                    chunk = ""
+                    for line in lines:
+                        if len(chunk) + len(line) + 1 > max_len:
+                            await send_telegram_message(session, tg_bot_token, tg_chat_id, chunk)
+                            await asyncio.sleep(0.5)
+                            chunk = line + "\n"
+                        else:
+                            chunk += line + "\n"
+                    if chunk:
+                        await send_telegram_message(session, tg_bot_token, tg_chat_id, chunk)
+            logger.info("[%s] Telegram report sent (if configured).", now_ts())
+        except Exception as e:
+            logger.exception("Warning: Failed to send Telegram report: %s", e)
+
+        return results
+
+def main():
+    fb_token = FB_USER_ACCESS_TOKEN
+    tg_bot = TELEGRAM_BOT_TOKEN
+    tg_chat = TELEGRAM_CHAT_ID
+    
+    if not fb_token:
+        print("❌ Please set FB_USER_ACCESS_TOKEN in the script and run again.")
+        sys.exit(1)
+
+    logger.info("[%s] Script started.", now_ts())
+    print("\n🚀 Fetching pages...\n")
+    
+    try:
+        results = asyncio.run(main_async(fb_token, tg_bot, tg_chat))
+        logger.info("[%s] Done.", now_ts())
+        
+        print("\n" + "="*70)
+        print("📊 Results:")
+        print("="*70)
+        for r in results:
+            page_name = fix_arabic_display(r.get('name', '<no-name>'))
+            print(f"• {page_name}: {r.get('open_convs')} open conversations (Total scanned: {r.get('total_scanned')})")
+        print("="*70 + "\n")
+        
+    except Exception as e:
+        logger.exception("Fatal error: %s", e)
+        sys.exit(2)
+
+if __name__ == "__main__":
+    main()
+
